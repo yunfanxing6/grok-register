@@ -104,35 +104,86 @@ func WriteAtomic(dir string, doc Document, secret []byte) (string, error) {
 	return path, nil
 }
 
-// Probe hits cli-chat-proxy with minimal responses call.
+// Probe hits cli-chat-proxy with minimal responses call (acpa_watchdog shape).
+// New tokens often get transient 403 permission-denied; warmup + short retries.
 // Returns nil if alive.
 func Probe(doc Document, proxy string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	if proxy != "" {
-		// rely on env proxy or leave direct — use Transport if needed
-		_ = proxy
+	_ = proxy
+	// Warmup: mint-then-immediate chat often 403s.
+	time.Sleep(3 * time.Second)
+
+	var last error
+	// Immediate 403 retries (default 2 sleeps of 4s like ACPA_403_IMMEDIATE_*)
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(4 * time.Second)
+		}
+		err := probeOnce(doc)
+		if err == nil {
+			return nil
+		}
+		last = err
+		msg := err.Error()
+		// transient permission-denied — retry
+		if strings.Contains(msg, "permission-denied") || strings.Contains(msg, "chat endpoint is denied") || strings.Contains(msg, "http=403") {
+			continue
+		}
+		// non-retryable
+		return err
 	}
+	return last
+}
+
+func probeOnce(doc Document) error {
+	client := &http.Client{Timeout: 45 * time.Second}
+	// Match keys/acpa_watchdog.py body exactly — bare content string can 403.
 	payload := map[string]any{
-		"model": "grok-4.5",
+		"model":             "grok-4.5",
+		"store":             false,
+		"stream":            false,
+		"max_output_tokens": 16,
 		"input": []map[string]any{
-			{"role": "user", "content": "ping"},
+			{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "input_text", "text": "ok"},
+				},
+			},
 		},
-		"max_output_tokens": 1,
 	}
 	raw, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(doc.BaseURL, "/")+"/responses", bytes.NewReader(raw))
+	base := strings.TrimRight(doc.BaseURL, "/")
+	if base == "" {
+		base = CliproxyBase
+	}
+	url := base + "/responses"
+	if strings.HasSuffix(base, "/responses") {
+		url = base
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
+	sid := "probe-" + doc.Sub
+	if doc.Sub == "" {
+		sid = fmt.Sprintf("probe-%d", time.Now().UnixNano())
+	}
+	rid := fmt.Sprintf("%d", time.Now().UnixNano())
 	req.Header.Set("Authorization", "Bearer "+doc.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	for k, v := range doc.Headers {
 		req.Header.Set(k, v)
 	}
-	// session-ish
-	req.Header.Set("x-grok-session-id", "probe-"+doc.Sub)
-	req.Header.Set("x-grok-req-id", fmt.Sprintf("%d", time.Now().UnixNano()))
+	req.Header.Set("Connection", "Keep-Alive")
+	req.Header.Set("x-grok-session-id", sid)
+	req.Header.Set("x-grok-conv-id", sid)
+	req.Header.Set("x-grok-req-id", rid)
+	req.Header.Set("x-grok-turn-idx", "1")
+	if len(rid) >= 8 {
+		req.Header.Set("x-grok-agent-id", "agent-"+rid[:8])
+	}
 	req.Header.Set("x-grok-model-override", "grok-4.5")
 	if doc.Email != "" {
 		req.Header.Set("x-email", doc.Email)
@@ -146,10 +197,17 @@ func Probe(doc Document, proxy string) error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	txt := string(body)
+	low := strings.ToLower(txt)
 	if resp.StatusCode == 200 {
 		return nil
 	}
-	return fmt.Errorf("probe http=%d body=%s", resp.StatusCode, truncate(string(body), 160))
+	// free exhausted / rate limit: still treat as "alive enough" for CPA count?
+	// Match watchdog: only 200 is alive; return error with marker.
+	if resp.StatusCode == 429 || strings.Contains(low, "free-usage-exhausted") || strings.Contains(low, "rate limit") {
+		return fmt.Errorf("probe http=%d rate/exhausted body=%s", resp.StatusCode, truncate(txt, 120))
+	}
+	return fmt.Errorf("probe http=%d body=%s", resp.StatusCode, truncate(txt, 160))
 }
 
 func AppendSSO(accountsPath, email, password, sso string) error {

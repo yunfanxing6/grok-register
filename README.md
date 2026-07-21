@@ -443,3 +443,9 @@ go build -o bin/grok ./cmd/grok
 ## License
 
 MIT（与上游 grok-free-register 思路一致；本仓库为 Go 重制版。）
+
+---
+
+## 友链
+
+- [LinuxDo · Charles0509](https://linux.do/u/charles0509)

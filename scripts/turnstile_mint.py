@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Mint Cloudflare Turnstile token via Playwright + CloakBrowser.
+"""Mint Cloudflare Turnstile token via CloakBrowser/Playwright.
 
 Same inject/click/poll path as grok_register/register.py (original project).
-Used by Grok-Reg Go binary when TURNSTILE_PROVIDER=browser.
+Used by Grok-Register Go binary when TURNSTILE_PROVIDER=browser.
 
 Usage:
   turnstile_mint.py --site-key KEY [--url URL] [--proxy URL] [--chrome PATH]
-                    [--cookie 'a=b; c=d'] [--timeout 90]
+                    [--cookie 'a=b; c=d'] [--ua UA] [--timeout 90]
 
 Prints only the token to stdout on success; errors to stderr, exit 1.
 """
@@ -85,180 +85,202 @@ async def mint(
     timeout: float,
     ua: str,
 ) -> str:
-    from playwright.async_api import async_playwright
+    # Prefer cloakbrowser (fingerprint-stable) when available — same as original project.
+    use_cloak = False
+    cloak_launch_async = None
+    try:
+        from cloakbrowser import launch_async as cloak_launch_async  # type: ignore
 
+        use_cloak = True
+    except Exception:
+        from playwright.async_api import async_playwright
+
+    launch_args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
     launch: dict = {
-        "executable_path": chrome,
         "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-infobars",
-        ],
+        "args": launch_args,
     }
+    if chrome:
+        launch["executable_path"] = chrome
     if proxy:
         launch["proxy"] = {"server": proxy}
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**launch)
-        try:
-            ctx_kwargs: dict = {"viewport": {"width": 800, "height": 600}}
-            if ua:
-                ctx_kwargs["user_agent"] = ua
-            context = await browser.new_context(**ctx_kwargs)
-            await context.add_init_script(
-                'Object.defineProperty(navigator,"webdriver",{get:()=>undefined})'
-            )
-            if cookies:
-                # Playwright wants url or domain; set for accounts.x.ai
-                for c in cookies:
+    pw_cm = None
+    if use_cloak and cloak_launch_async is not None:
+        browser = await cloak_launch_async(**launch)
+    else:
+        from playwright.async_api import async_playwright
+
+        pw_cm = await async_playwright().start()
+        browser = await pw_cm.chromium.launch(**launch)
+
+    try:
+        ctx_kwargs: dict = {"viewport": {"width": 800, "height": 600}}
+        if ua:
+            ctx_kwargs["user_agent"] = ua
+        context = await browser.new_context(**ctx_kwargs)
+        await context.add_init_script(
+            'Object.defineProperty(navigator,"webdriver",{get:()=>undefined})'
+        )
+        if cookies:
+            for c in cookies:
+                try:
+                    await context.add_cookies(
+                        [
+                            {
+                                "name": c["name"],
+                                "value": c["value"],
+                                "domain": c.get("domain") or ".x.ai",
+                                "path": c.get("path") or "/",
+                            }
+                        ]
+                    )
+                except Exception:
                     try:
                         await context.add_cookies(
                             [
                                 {
                                     "name": c["name"],
                                     "value": c["value"],
-                                    "domain": c.get("domain") or ".x.ai",
-                                    "path": c.get("path") or "/",
                                     "url": "https://accounts.x.ai/",
+                                    "path": "/",
                                 }
                             ]
                         )
                     except Exception:
-                        try:
-                            await context.add_cookies(
-                                [
-                                    {
-                                        "name": c["name"],
-                                        "value": c["value"],
-                                        "url": "https://accounts.x.ai/",
-                                        "path": "/",
-                                    }
-                                ]
-                            )
-                        except Exception:
-                            pass
+                        pass
 
-            page = await context.new_page()
-            await page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1000)
+        page = await context.new_page()
+        await page.goto(page_url, timeout=45000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
 
-            # Exact inject from grok_register/register.py _inject_turnstile_widget
-            inject = (
-                "var d=document.createElement('div');"
-                "d.className='cf-turnstile';"
-                f"d.setAttribute('data-sitekey','{site_key}');"
-                "d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;"
-                "background:white;padding:12px;border:2px solid red;border-radius:6px;"
-                "width:300px;height:70px';"
-                "document.body.appendChild(d);"
-                "function __r(){"
-                "window.turnstile&&window.turnstile.render(d,{"
-                f"sitekey:'{site_key}',"
-                "callback:function(t){"
-                'var i=document.querySelector(\'input[name="cf-turnstile-response"]\');'
-                "if(!i){i=document.createElement('input');i.type='hidden';"
-                "i.name='cf-turnstile-response';document.body.appendChild(i);}"
-                "i.value=t;"
-                "}})}"
-                "if(window.turnstile){__r()}"
-                "else{var s=document.createElement('script');"
-                "s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';"
-                "s.onload=function(){setTimeout(__r,1000)};"
-                "document.head.appendChild(s);}"
-            )
-            await page.evaluate(inject)
+        # Exact inject from grok_register/register.py _inject_turnstile_widget
+        inject = (
+            "var d=document.createElement('div');"
+            "d.className='cf-turnstile';"
+            f"d.setAttribute('data-sitekey','{site_key}');"
+            "d.style.cssText='position:fixed;top:10px;left:10px;z-index:99999;"
+            "background:white;padding:12px;border:2px solid red;border-radius:6px;"
+            "width:300px;height:70px';"
+            "document.body.appendChild(d);"
+            "function __r(){"
+            "window.turnstile&&window.turnstile.render(d,{"
+            f"sitekey:'{site_key}',"
+            "callback:function(t){"
+            'var i=document.querySelector(\'input[name="cf-turnstile-response"]\');'
+            "if(!i){i=document.createElement('input');i.type='hidden';"
+            "i.name='cf-turnstile-response';document.body.appendChild(i);}"
+            "i.value=t;"
+            "}})}"
+            "if(window.turnstile){__r()}"
+            "else{var s=document.createElement('script');"
+            "s.src='https://challenges.cloudflare.com/turnstile/v0/api.js';"
+            "s.onload=function(){setTimeout(__r,1000)};"
+            "document.head.appendChild(s);}"
+        )
+        await page.evaluate(inject)
 
-            initial_ms = int(os.environ.get("SOLVER_INITIAL_WAIT_MS", "500") or "500")
-            await page.wait_for_timeout(max(0, initial_ms))
+        initial_ms = int(os.environ.get("SOLVER_INITIAL_WAIT_MS", "500") or "500")
+        await page.wait_for_timeout(max(0, initial_ms))
 
-            async def read_token() -> str:
-                try:
-                    return await page.evaluate(
-                        'document.querySelector(\'input[name="cf-turnstile-response"]\')?.value||""'
-                    )
-                except Exception:
-                    return ""
-
-            # early poll 2x800ms
-            for _ in range(2):
-                t = await read_token()
-                if t and len(t) > 10:
-                    return t
-                await page.wait_for_timeout(800)
-
-            async def click_center() -> None:
-                box = await page.evaluate(
-                    """() => {
-                    const e = document.querySelector('.cf-turnstile');
-                    if (!e) return null;
-                    const r = e.getBoundingClientRect();
-                    return {x: r.left + r.width / 2, y: r.top + r.height / 2};
-                }"""
+        async def read_token() -> str:
+            try:
+                return await page.evaluate(
+                    'document.querySelector(\'input[name="cf-turnstile-response"]\')?.value||""'
                 )
-                if not box:
-                    return
-                x, y = float(box["x"]), float(box["y"])
-                await page.mouse.move(max(0, x - 25), max(0, y - 8))
-                await page.mouse.move(x, y, steps=8)
-                await page.mouse.down()
-                await asyncio.sleep(0.05)
-                await page.mouse.up()
+            except Exception:
+                return ""
 
-            retries = int(os.environ.get("SOLVER_MOUSE_CLICK_RETRIES", "3") or "3")
-            interval = int(os.environ.get("SOLVER_MOUSE_CLICK_INTERVAL_MS", "600") or "600")
-            for i in range(max(0, retries)):
-                t = await read_token()
-                if t and len(t) > 10:
-                    return t
+        for _ in range(2):
+            t = await read_token()
+            if t and len(t) > 10:
+                return t
+            await page.wait_for_timeout(800)
+
+        async def click_center() -> None:
+            box = await page.evaluate(
+                """() => {
+                const e = document.querySelector('.cf-turnstile');
+                if (!e) return null;
+                const r = e.getBoundingClientRect();
+                return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+            }"""
+            )
+            if not box:
+                return
+            x, y = float(box["x"]), float(box["y"])
+            await page.mouse.move(max(0, x - 25), max(0, y - 8))
+            await page.mouse.move(x, y, steps=8)
+            await page.mouse.down()
+            await asyncio.sleep(0.05)
+            await page.mouse.up()
+
+        retries = int(os.environ.get("SOLVER_MOUSE_CLICK_RETRIES", "3") or "3")
+        interval = int(os.environ.get("SOLVER_MOUSE_CLICK_INTERVAL_MS", "600") or "600")
+        for i in range(max(0, retries)):
+            t = await read_token()
+            if t and len(t) > 10:
+                return t
+            try:
+                await click_center()
+            except Exception:
+                pass
+            if i + 1 < retries:
+                await page.wait_for_timeout(max(50, interval))
+
+        poll_ms = int(os.environ.get("SOLVER_POLL_INTERVAL_MS", "500") or "500")
+        attempts = int(os.environ.get("SOLVER_POLL_ATTEMPTS", "100") or "100")
+        deadline = time.time() + timeout
+        for i in range(max(1, attempts)):
+            if time.time() > deadline:
+                break
+            await page.wait_for_timeout(max(50, poll_ms))
+            t = await read_token()
+            if t and len(t) > 10:
+                return t
+            if i > 0 and i % 20 == 0:
                 try:
                     await click_center()
                 except Exception:
                     pass
-                if i + 1 < retries:
-                    await page.wait_for_timeout(max(50, interval))
 
-            poll_ms = int(os.environ.get("SOLVER_POLL_INTERVAL_MS", "500") or "500")
-            attempts = int(os.environ.get("SOLVER_POLL_ATTEMPTS", "100") or "100")
-            deadline = time.time() + timeout
-            for i in range(max(1, attempts)):
-                if time.time() > deadline:
-                    break
-                await page.wait_for_timeout(max(50, poll_ms))
-                t = await read_token()
-                if t and len(t) > 10:
-                    return t
-                if i > 0 and i % 20 == 0:
-                    try:
-                        await click_center()
-                    except Exception:
-                        pass
-
-            # diag
+        try:
+            diag = await page.evaluate(
+                """() => {
+                const ifr=[...document.querySelectorAll('iframe')].filter(f=>{
+                  const s=f.src||'';
+                  return s.includes('turnstile')||s.includes('challenges.cloudflare.com');
+                }).length;
+                return {
+                  iframes: ifr,
+                  all_ifr: document.querySelectorAll('iframe').length,
+                  widget: !!document.querySelector('.cf-turnstile'),
+                  turnstile: !!window.turnstile,
+                  title: document.title||'',
+                };
+            }"""
+            )
+            print(f"diag={diag}", file=sys.stderr)
+        except Exception:
+            pass
+        raise RuntimeError("turnstile timeout (no token)")
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        if pw_cm is not None:
             try:
-                diag = await page.evaluate(
-                    """() => {
-                    const ifr=[...document.querySelectorAll('iframe')].filter(f=>{
-                      const s=f.src||'';
-                      return s.includes('turnstile')||s.includes('challenges.cloudflare.com');
-                    }).length;
-                    return {
-                      iframes: ifr,
-                      all_ifr: document.querySelectorAll('iframe').length,
-                      widget: !!document.querySelector('.cf-turnstile'),
-                      turnstile: !!window.turnstile,
-                      title: document.title||'',
-                    };
-                }"""
-                )
-                print(f"diag={diag}", file=sys.stderr)
+                await pw_cm.stop()
             except Exception:
                 pass
-            raise RuntimeError("turnstile timeout (no token)")
-        finally:
-            await browser.close()
 
 
 def main() -> int:
@@ -295,7 +317,6 @@ def main() -> int:
     if not token or len(token) <= 10:
         print("empty token", file=sys.stderr)
         return 1
-    # token only on stdout
     sys.stdout.write(token)
     return 0
 

@@ -71,7 +71,11 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 	if p.Proxy != "" {
 		args = append(args, "--proxy", p.Proxy)
 	}
-	if p.Clear != nil {
+	// Do NOT inject FlareSolverr cookies/UA by default.
+	// Manual mint without them succeeds; injecting FS UA+cookies into CloakBrowser
+	// often yields iframes=0 / no token (fingerprint + session mismatch).
+	// Opt-in: GROK_TURNSTILE_INJECT_CLEARANCE=1
+	if injectClearance() && p.Clear != nil {
 		if h := p.Clear.CookieHeader(); h != "" {
 			args = append(args, "--cookie", h)
 		}
@@ -111,6 +115,11 @@ func (p *PlaywrightBridge) Solve(ctx context.Context, siteKey, pageURL string) (
 // DetectedPython / DetectedScript expose resolved mint paths for startup logs.
 func DetectedPython() string { return findPython() }
 func DetectedScript() string { return findMintScript() }
+
+func injectClearance() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("GROK_TURNSTILE_INJECT_CLEARANCE")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
 
 func findPython() string {
 	for _, name := range []string{

@@ -22,6 +22,7 @@ import (
 	"github.com/grok-free-register/grok-reg/internal/logx"
 	"github.com/grok-free-register/grok-reg/internal/oauth"
 	"github.com/grok-free-register/grok-reg/internal/protocol"
+	"github.com/grok-free-register/grok-reg/internal/sink"
 	"github.com/grok-free-register/grok-reg/internal/state"
 	"github.com/grok-free-register/grok-reg/internal/turnstile"
 )
@@ -62,6 +63,7 @@ type Engine struct {
 
 	oauthCh  chan SSOJob
 	uploader *cpa.Uploader
+	g2a      *sink.Uploader
 
 	done     atomic.Int64 // CPA successes (counts toward -t)
 	reserved atomic.Int64 // in-flight accounts (email→register→oauth→probe)
@@ -75,8 +77,32 @@ type Engine struct {
 	wgAux   sync.WaitGroup // status ticker etc
 }
 
-// remainingCapacity = target - done - reserved (how many new accounts may start).
+// softSeatCap limits in-flight accounts (especially important for infinite mode).
+func (e *Engine) softSeatCap() int {
+	soft := e.opt.Cfg.TurnstileWorkers
+	if soft < 1 {
+		soft = 1
+	}
+	if soft > 4 {
+		soft = 4
+	}
+	if e.opt.Cfg.PhysicalCap > 0 && e.opt.Cfg.PhysicalCap < soft {
+		soft = e.opt.Cfg.PhysicalCap
+	}
+	return soft
+}
+
+// remainingCapacity = seats still allowed to start new accounts.
+// Finite: target - done - reserved.
+// Infinite (target<=0): softSeatCap - reserved (keeps pipeline moving without flooding).
 func (e *Engine) remainingCapacity() int {
+	if config.IsInfiniteTarget(e.opt.Target) {
+		n := e.softSeatCap() - int(e.reserved.Load())
+		if n < 0 {
+			return 0
+		}
+		return n
+	}
 	n := e.opt.Target - int(e.done.Load()) - int(e.reserved.Load())
 	if n < 0 {
 		return 0
@@ -89,7 +115,11 @@ func (e *Engine) tryReserve() bool {
 	for {
 		d := e.done.Load()
 		r := e.reserved.Load()
-		if d+r >= int64(e.opt.Target) {
+		if config.IsInfiniteTarget(e.opt.Target) {
+			if int(r) >= e.softSeatCap() {
+				return false
+			}
+		} else if d+r >= int64(e.opt.Target) {
 			return false
 		}
 		if e.reserved.CompareAndSwap(r, r+1) {
@@ -112,7 +142,12 @@ func (e *Engine) releaseReserve() {
 
 // tryComplete moves a reserved seat into done. Returns (newDone, ok).
 // ok=false means target already met (caller should discard extra success).
+// Infinite mode always accepts.
 func (e *Engine) tryComplete() (int64, bool) {
+	if config.IsInfiniteTarget(e.opt.Target) {
+		e.releaseReserve()
+		return e.done.Add(1), true
+	}
 	for {
 		d := e.done.Load()
 		if d >= int64(e.opt.Target) {
@@ -147,7 +182,11 @@ func (e *Engine) run(ctx context.Context) error {
 	// Pending email codes in flight: cap by target so target=5 doesn't open 12 boxes.
 	qPend := cfg.Target
 	if qPend <= 0 {
-		qPend = 4
+		// infinite mode: small pending email/code budget
+		qPend = e.softSeatCap() + 1
+		if qPend < 2 {
+			qPend = 2
+		}
 	}
 	if qPend > 6 {
 		qPend = 6
@@ -159,6 +198,9 @@ func (e *Engine) run(ctx context.Context) error {
 	tSlots, qSlots := 4, 4
 	if cfg.Target > 0 && cfg.Target < 4 {
 		tSlots, qSlots = cfg.Target, cfg.Target
+	}
+	if config.IsInfiniteTarget(cfg.Target) {
+		tSlots, qSlots = e.softSeatCap(), e.softSeatCap()
 	}
 	e.inv = inventory.New[string, QItem](tSlots, qSlots)
 	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend)
@@ -197,18 +239,28 @@ func (e *Engine) run(ctx context.Context) error {
 		return err
 	}
 	e.mail = email.New(email.Config{
-		Mode:              cfg.EmailMode,
-		Domain:            cfg.EmailDomain,
-		API:               cfg.EmailAPI,
-		LOLRetries:        cfg.TempmailLOLRetries,
-		LOLIntervalMS:     cfg.TempmailLOLIntervalMS,
-		TestmailAPIKey:    cfg.TestmailAPIKey,
-		TestmailNamespace: cfg.TestmailNamespace,
-		TestmailDomain:    cfg.TestmailDomain,
+		Mode:                   cfg.EmailMode,
+		Domain:                 cfg.EmailDomain,
+		API:                    cfg.EmailAPI,
+		LOLRetries:             cfg.TempmailLOLRetries,
+		LOLIntervalMS:          cfg.TempmailLOLIntervalMS,
+		TestmailAPIKey:         cfg.TestmailAPIKey,
+		TestmailNamespace:      cfg.TestmailNamespace,
+		TestmailDomain:         cfg.TestmailDomain,
+		CloudmailAdminEmail:    cfg.CloudmailAdminEmail,
+		CloudmailAdminPassword: cfg.CloudmailAdminPassword,
+		CloudmailProxy:         cfg.CloudmailProxy,
 	})
-	if cfg.EmailMode == config.EmailTestmail {
+	switch cfg.EmailMode {
+	case config.EmailTestmail:
 		log.Infof("Email mode=testmail namespace=%s domain=%s", cfg.TestmailNamespace, cfg.TestmailDomain)
-	} else {
+	case config.EmailCloudmail:
+		px := cfg.CloudmailProxy
+		if px == "" {
+			px = "(inherit HTTP_PROXY)"
+		}
+		log.Infof("Email mode=cloudmail api=%s domain=%s admin=%s proxy=%s", cfg.EmailAPI, cfg.EmailDomain, cfg.CloudmailAdminEmail, px)
+	default:
 		log.Infof("Email mode=%s", cfg.EmailMode)
 	}
 	e.turn = turnstile.New(turnstile.Options{
@@ -238,6 +290,26 @@ func (e *Engine) run(ctx context.Context) error {
 	if e.uploader.Enabled() {
 		log.Infof("CPA upload enabled base=%s", cfg.CPAManagementBase)
 	}
+	e.g2a = sink.New(sink.Config{
+		JiujiuEnabled:      cfg.G2AJiujiuEnabled,
+		JiujiuBase:         cfg.G2AJiujiuBase,
+		JiujiuToken:        cfg.G2AJiujiuToken,
+		JiujiuPool:         cfg.G2AJiujiuPool,
+		ChenymeEnabled:     cfg.G2AChenymeEnabled,
+		ChenymeBase:        cfg.G2AChenymeBase,
+		ChenymeUser:        cfg.G2AChenymeUser,
+		ChenymePassword:    cfg.G2AChenymePassword,
+		ChenymeUploadSSO:   cfg.G2AChenymeUploadSSO,
+		ChenymeUploadBuild: cfg.G2AChenymeUploadBuild,
+	}, func(f string, a ...any) {
+		log.Infof(f, a...)
+	})
+	if e.g2a.Enabled() {
+		log.Infof("g2a sink: jiujiu=%v(%s) chenyme=%v(%s sso=%v build=%v)",
+			cfg.G2AJiujiuEnabled, cfg.G2AJiujiuBase,
+			cfg.G2AChenymeEnabled, cfg.G2AChenymeBase,
+			cfg.G2AChenymeUploadSSO, cfg.G2AChenymeUploadBuild)
+	}
 	e.oauth, err = oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second)
 	if err != nil {
 		return err
@@ -258,7 +330,11 @@ func (e *Engine) run(ctx context.Context) error {
 		return fmt.Errorf("config fetch: %w", err)
 	}
 	log.Infof("SITE_KEY=%s ACTION_ID=%s...", scfg.SiteKey, trim(scfg.ActionID, 12))
-	log.OKf("注册服务已启动 | 目标 %d | run=%s", e.opt.Target, e.opt.Run.RunID)
+	if config.IsInfiniteTarget(e.opt.Target) {
+		log.OKf("注册服务已启动 | 目标 无限 | run=%s", e.opt.Run.RunID)
+	} else {
+		log.OKf("注册服务已启动 | 目标 %d | run=%s", e.opt.Target, e.opt.Run.RunID)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -310,7 +386,7 @@ func (e *Engine) run(ctx context.Context) error {
 
 	// wait until target or cancel
 	for {
-		if int(e.done.Load()) >= e.opt.Target {
+		if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 			log.OKf("已达目标 %d，停止", e.opt.Target)
 			cancel()
 			break
@@ -335,7 +411,11 @@ shutdown:
 			s.Status = state.StatusStopped
 		}
 		s.Phase = state.PhaseIdle
-		s.PhaseDetail = fmt.Sprintf("完成 %d/%d", e.done.Load(), e.opt.Target)
+		if config.IsInfiniteTarget(e.opt.Target) {
+			s.PhaseDetail = fmt.Sprintf("运行中(无限) 成功=%d", e.done.Load())
+		} else {
+			s.PhaseDetail = fmt.Sprintf("完成 %d/%d", e.done.Load(), e.opt.Target)
+		}
 		s.Done = int(e.done.Load())
 		s.SSOCount = int(e.ssoN.Load())
 		s.OAuthCount = int(e.oaN.Load())
@@ -360,7 +440,11 @@ func (e *Engine) refreshState() {
 		s.FailCount = int(e.fail.Load())
 		s.RatePerMin = rate
 		if s.Phase == state.PhaseRegister || s.Phase == "" {
-			s.PhaseDetail = fmt.Sprintf("注册中 T=%d Q=%d done=%d/%d inflight=%d", t, q, e.done.Load(), e.opt.Target, e.reserved.Load())
+			if config.IsInfiniteTarget(e.opt.Target) {
+				s.PhaseDetail = fmt.Sprintf("无限注册 T=%d Q=%d done=%d inflight=%d", t, q, e.done.Load(), e.reserved.Load())
+			} else {
+				s.PhaseDetail = fmt.Sprintf("注册中 T=%d Q=%d done=%d/%d inflight=%d", t, q, e.done.Load(), e.opt.Target, e.reserved.Load())
+			}
 		}
 	})
 }
@@ -383,26 +467,24 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	log := e.opt.Log
 	pageURL := protocol.SiteURL + "/sign-up"
 	for {
-		if e.remainingCapacity() <= 0 && int(e.done.Load()) >= e.opt.Target {
+		if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 			return
 		}
-		// Don't mint far ahead of what we still need.
-		if e.remainingCapacity() <= 0 {
+		// Token demand:
+		// - remainingCapacity: seats not yet reserved (future accounts)
+		// - qDepth: reserved seats already holding email/code, still need a Turnstile token
+		// Without counting qDepth, P can reserve first and starve S forever (deadlock).
+		tDepth, qDepth := e.inv.Depths()
+		need := e.remainingCapacity() + qDepth
+		if need < 1 {
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(500 * time.Millisecond):
 			}
-			if int(e.done.Load()) >= e.opt.Target {
-				return
-			}
 			continue
 		}
-		tDepth, _ := e.inv.Depths()
-		need := e.remainingCapacity()
-		if need < 1 {
-			need = 1
-		}
+		// Don't mint far ahead of demand.
 		if tDepth >= need {
 			select {
 			case <-ctx.Done():
@@ -441,7 +523,7 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 	defer e.wgReg.Done()
 	log := e.opt.Log
 	for {
-		if int(e.done.Load()) >= e.opt.Target {
+		if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 			return
 		}
 		select {
@@ -456,7 +538,7 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 				return
 			case <-time.After(500 * time.Millisecond):
 			}
-			if int(e.done.Load()) >= e.opt.Target {
+			if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 				return
 			}
 			continue
@@ -523,7 +605,9 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			continue
 		}
 		item := QItem{Email: h.Email, Password: h.Password, Code: code, Handle: h}
-		if err := e.inv.PutQ(ctx, item, 2*time.Minute); err != nil {
+		// Q must outlive Turnstile mint (often 1–3+ min under CF). Short TTL
+		// drops verified email/code while S is still minting → stuck T-only queue.
+		if err := e.inv.PutQ(ctx, item, 15*time.Minute); err != nil {
 			e.qPending.Release()
 			e.releaseReserve()
 			return
@@ -538,7 +622,7 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	defer e.wgReg.Done()
 	log := e.opt.Log
 	for {
-		if int(e.done.Load()) >= e.opt.Target {
+		if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 			return
 		}
 		pair, err := e.inv.ClaimPair(ctx)
@@ -586,6 +670,15 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		_ = cpa.AppendAuthSession(filepath.Join(e.opt.Run.SSO, "auth-sessions.jsonl"), q.Email, sso)
 		n := e.ssoN.Add(1)
 		log.OKf("注册成功 #%d %s", n, q.Email)
+		// Auto-upload SSO to grok2api sinks (jiujiu + chenyme web)
+		if e.g2a != nil && e.g2a.Enabled() {
+			email, ssoCopy := q.Email, sso
+			g2a := e.g2a
+			go func() {
+				defer func() { _ = recover() }()
+				g2a.OnSSO(email, ssoCopy)
+			}()
+		}
 
 		job := SSOJob{Email: q.Email, Password: q.Password, SSO: sso}
 		select {
@@ -614,7 +707,7 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	var last time.Time
 	for job := range e.oauthCh {
 		// Soft-stop: still drain with seat accounting, but skip work past target.
-		if int(e.done.Load()) >= e.opt.Target {
+		if !config.IsInfiniteTarget(e.opt.Target) && int(e.done.Load()) >= e.opt.Target {
 			e.releaseReserve()
 			continue
 		}
@@ -679,7 +772,20 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 				_ = up.UploadDocument(docCopy)
 			}()
 		}
-		log.OKf("CPA 就绪 #%d/%d %s -> %s", d, e.opt.Target, job.Email, filepath.Base(path))
+		// Upload Build OAuth (CPA JSON) to chenyme before counting complete —
+		// do it inline so process exit cannot race with async import.
+		if e.g2a != nil && e.g2a.Enabled() {
+			if raw, rerr := os.ReadFile(path); rerr == nil {
+				e.g2a.OnBuildOAuth(job.Email, filepath.Base(path), raw)
+			} else {
+				log.Warnf("read CPA for g2a upload: %v", rerr)
+			}
+		}
+		if config.IsInfiniteTarget(e.opt.Target) {
+			log.OKf("CPA 就绪 #%d (无限) %s -> %s", d, job.Email, filepath.Base(path))
+		} else {
+			log.OKf("CPA 就绪 #%d/%d %s -> %s", d, e.opt.Target, job.Email, filepath.Base(path))
+		}
 		e.refreshState()
 	}
 }
@@ -721,22 +827,30 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 		}
 	}
 	// P workers: don't spawn 8 when target is 5 (was flooding tempmail).
+	// Infinite (target<=0): keep P=1 (or soft seat) so email creation stays single-lane.
 	target := cfg.Target
-	if target <= 0 {
-		target = 10
-	}
-	p = target
-	if p > 4 {
-		p = 4
-	}
-	if p < 1 {
+	if config.IsInfiniteTarget(target) {
 		p = 1
-	}
-	c = 2
-	if target < 2 {
+		if cfg.TurnstileWorkers > 1 {
+			// still single-thread friendly when --thread 1
+			p = 1
+		}
 		c = 1
+		oa = 2
+	} else {
+		p = target
+		if p > 4 {
+			p = 4
+		}
+		if p < 1 {
+			p = 1
+		}
+		c = 2
+		if target < 2 {
+			c = 1
+		}
+		oa = 2
 	}
-	oa = 2
 	if s < 1 {
 		s = 1
 	}

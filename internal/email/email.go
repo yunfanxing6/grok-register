@@ -30,7 +30,7 @@ var codeRe = []*regexp.Regexp{
 }
 
 type Handle struct {
-	Kind     string // lol | mt | custom | testmail
+	Kind     string // lol | mt | custom | testmail | cloudmail
 	Email    string
 	Password string
 	Token    string
@@ -38,6 +38,8 @@ type Handle struct {
 	// testmail.app
 	Tag       string
 	Timestamp int64 // ms — only accept mails after Create()
+	// cloudmail
+	AccountID string
 }
 
 type Provider struct {
@@ -45,6 +47,9 @@ type Provider struct {
 	mu  sync.Mutex
 	// lol rate limit
 	lolNextOK time.Time
+	// cloudmail admin JWT cache
+	cloudmailToken   string
+	cloudmailTokenAt time.Time
 }
 
 type Config struct {
@@ -57,12 +62,24 @@ type Config struct {
 	TestmailAPIKey    string
 	TestmailNamespace string
 	TestmailDomain    string
-	HTTPClient        *http.Client
+	// Cloud Mail admin credentials
+	CloudmailAdminEmail    string
+	CloudmailAdminPassword string
+	// CloudmailProxy: dedicated proxy for Cloud Mail (e.g. http://127.0.0.1:10808).
+	// Empty → use HTTPClient / ProxyFromEnvironment.
+	CloudmailProxy string
+	HTTPClient     *http.Client
 }
 
 func New(cfg Config) *Provider {
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 20 * time.Second}
+		// Honor HTTP(S)_PROXY / NO_PROXY from ApplyProxyEnv
+		cfg.HTTPClient = &http.Client{
+			Timeout: 25 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+			},
+		}
 	}
 	if cfg.LOLRetries <= 0 {
 		cfg.LOLRetries = 8
@@ -71,6 +88,31 @@ func New(cfg Config) *Provider {
 		cfg.LOLIntervalMS = 400
 	}
 	return &Provider{cfg: cfg}
+}
+
+// mailClient returns the HTTP client for Cloud Mail.
+// Prefer CLOUDMAIL_PROXY (local foreign node :10808) so register can stay on WARP :40080.
+func (p *Provider) mailClient() *http.Client {
+	if px := strings.TrimSpace(p.cfg.CloudmailProxy); px != "" {
+		u, err := url.Parse(px)
+		if err == nil && u.Scheme != "" {
+			return &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					Proxy: http.ProxyURL(u),
+				},
+			}
+		}
+	}
+	if p.cfg.HTTPClient != nil {
+		return p.cfg.HTTPClient
+	}
+	return &http.Client{
+		Timeout: 25 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
+	}
 }
 
 func randStr(n int) string {
@@ -90,6 +132,13 @@ func (p *Provider) Create() (Handle, error) {
 		return Handle{Kind: "custom", Email: email, Password: password}, nil
 	case config.EmailTestmail:
 		h, err := p.testmailCreate()
+		if err != nil {
+			return Handle{}, err
+		}
+		h.Password = password
+		return h, nil
+	case config.EmailCloudmail:
+		h, err := p.cloudmailCreate()
 		if err != nil {
 			return Handle{}, err
 		}
@@ -285,6 +334,8 @@ func (p *Provider) fetch(h Handle) (string, error) {
 			return c, nil
 		}
 		return "", nil
+	case "cloudmail":
+		return p.cloudmailFetch(h)
 	case "lol":
 		resp, err := p.cfg.HTTPClient.Get("https://api.tempmail.lol/v2/inbox?token=" + url.QueryEscape(h.Token))
 		if err != nil {
@@ -339,6 +390,329 @@ func (p *Provider) fetch(h Handle) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown handle kind")
 	}
+}
+
+// cloudmailAPIBase normalizes EMAIL_API to .../api root.
+// Accepts either https://host or https://host/api.
+func (p *Provider) cloudmailAPIBase() string {
+	base := strings.TrimRight(strings.TrimSpace(p.cfg.API), "/")
+	if base == "" {
+		return ""
+	}
+	if strings.HasSuffix(base, "/api") {
+		return base
+	}
+	return base + "/api"
+}
+
+func (p *Provider) cloudmailLogin() (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// reuse token for ~50 minutes
+	if p.cloudmailToken != "" && time.Since(p.cloudmailTokenAt) < 50*time.Minute {
+		return p.cloudmailToken, nil
+	}
+	email := strings.TrimSpace(p.cfg.CloudmailAdminEmail)
+	pass := p.cfg.CloudmailAdminPassword
+	if email == "" || pass == "" {
+		return "", fmt.Errorf("cloudmail: set CLOUDMAIL_ADMIN_EMAIL and CLOUDMAIL_ADMIN_PASSWORD")
+	}
+	api := p.cloudmailAPIBase()
+	if api == "" {
+		return "", fmt.Errorf("cloudmail: set EMAIL_API (e.g. https://xxx.workers.dev/api)")
+	}
+	payload, _ := json.Marshal(map[string]string{"email": email, "password": pass})
+	req, err := http.NewRequest(http.MethodPost, api+"/login", strings.NewReader(string(payload)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; grok-reg/cloudmail)")
+	resp, err := p.mailClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("cloudmail login http=%d body=%s", resp.StatusCode, truncate(string(body), 120))
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", err
+	}
+	if code, ok := doc["code"].(float64); ok && int(code) != 200 {
+		msg, _ := doc["message"].(string)
+		return "", fmt.Errorf("cloudmail login failed: %s", msg)
+	}
+	tok := extractCloudmailToken(doc)
+	if tok == "" {
+		return "", fmt.Errorf("cloudmail login: no token in response")
+	}
+	p.cloudmailToken = tok
+	p.cloudmailTokenAt = time.Now()
+	return tok, nil
+}
+
+func extractCloudmailToken(payload any) string {
+	switch v := payload.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]any:
+		for _, k := range []string{"token", "access_token", "jwt"} {
+			if s, ok := v[k].(string); ok && s != "" {
+				return s
+			}
+		}
+		for _, k := range []string{"data", "result"} {
+			if nested := extractCloudmailToken(v[k]); nested != "" {
+				return nested
+			}
+		}
+	}
+	return ""
+}
+
+func extractCloudmailAccountID(payload any) string {
+	switch v := payload.(type) {
+	case map[string]any:
+		for _, k := range []string{"accountId", "id"} {
+			switch x := v[k].(type) {
+			case string:
+				if x != "" {
+					return x
+				}
+			case float64:
+				return fmt.Sprintf("%.0f", x)
+			case json.Number:
+				return x.String()
+			}
+		}
+		for _, k := range []string{"data", "result"} {
+			if nested := extractCloudmailAccountID(v[k]); nested != "" {
+				return nested
+			}
+		}
+	}
+	return ""
+}
+
+func extractCloudmailMessages(payload any) []map[string]any {
+	switch v := payload.(type) {
+	case []any:
+		var out []map[string]any
+		for _, it := range v {
+			if m, ok := it.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	case map[string]any:
+		for _, k := range []string{"results", "data", "mails", "items", "messages", "list"} {
+			if nested := extractCloudmailMessages(v[k]); len(nested) > 0 {
+				return nested
+			}
+		}
+	}
+	return nil
+}
+
+// cloudmailCreate: admin login → POST /account/add with random local@domain.
+// Mirrors yunfanxing6/grok-register email_register.py Cloud Mail path.
+func (p *Provider) cloudmailCreate() (Handle, error) {
+	domain := strings.TrimSpace(strings.TrimPrefix(p.cfg.Domain, "@"))
+	if domain == "" {
+		return Handle{}, fmt.Errorf("cloudmail: set EMAIL_DOMAIN")
+	}
+	api := p.cloudmailAPIBase()
+	if api == "" {
+		return Handle{}, fmt.Errorf("cloudmail: set EMAIL_API")
+	}
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		tok, err := p.cloudmailLogin()
+		if err != nil {
+			return Handle{}, err
+		}
+		local := "oc" + randStr(10)
+		email := fmt.Sprintf("%s@%s", local, domain)
+		payload, _ := json.Marshal(map[string]string{"email": email})
+		req, err := http.NewRequest(http.MethodPost, api+"/account/add", strings.NewReader(string(payload)))
+		if err != nil {
+			return Handle{}, err
+		}
+		// Cloud Mail expects raw JWT, not "Bearer <token>"
+		req.Header.Set("Authorization", tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; grok-reg/cloudmail)")
+		resp, err := p.mailClient().Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			// force re-login on auth failure
+			if resp.StatusCode == 401 || strings.Contains(string(body), "身份认证") {
+				p.mu.Lock()
+				p.cloudmailToken = ""
+				p.mu.Unlock()
+			}
+			last = fmt.Errorf("cloudmail account/add http=%d body=%s", resp.StatusCode, truncate(string(body), 120))
+			continue
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(body, &doc); err != nil {
+			last = err
+			continue
+		}
+		if code, ok := doc["code"].(float64); ok && int(code) != 200 {
+			msg, _ := doc["message"].(string)
+			// invalidate token if auth expired mid-session
+			if strings.Contains(msg, "身份认证") {
+				p.mu.Lock()
+				p.cloudmailToken = ""
+				p.mu.Unlock()
+			}
+			last = fmt.Errorf("cloudmail account/add: %s", msg)
+			continue
+		}
+		accountID := extractCloudmailAccountID(doc)
+		if accountID == "" {
+			last = fmt.Errorf("cloudmail account/add: no accountId in %s", truncate(string(body), 120))
+			continue
+		}
+		return Handle{
+			Kind:      "cloudmail",
+			Email:     email,
+			Token:     tok,
+			AccountID: accountID,
+			Base:      api,
+			Timestamp: time.Now().UnixMilli(),
+		}, nil
+	}
+	if last == nil {
+		last = fmt.Errorf("cloudmail account/add failed")
+	}
+	return Handle{}, last
+}
+
+func (p *Provider) cloudmailFetch(h Handle) (string, error) {
+	api := h.Base
+	if api == "" {
+		api = p.cloudmailAPIBase()
+	}
+	tok := h.Token
+	if tok == "" {
+		var err error
+		tok, err = p.cloudmailLogin()
+		if err != nil {
+			return "", err
+		}
+	}
+	if h.AccountID == "" {
+		return "", fmt.Errorf("cloudmail: missing accountId")
+	}
+	// GET /email/list?accountId=&allReceive=0&type=1&size=20&emailId=0&timeSort=0
+	q := url.Values{}
+	q.Set("accountId", h.AccountID)
+	q.Set("allReceive", "0")
+	q.Set("type", "1")
+	q.Set("size", "20")
+	q.Set("emailId", "0")
+	q.Set("timeSort", "0")
+	req, err := http.NewRequest(http.MethodGet, api+"/email/list?"+q.Encode(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", tok)
+	req.Header.Set("Accept", "application/json")
+	client := p.mailClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != 200 {
+		if resp.StatusCode == 401 || strings.Contains(string(body), "身份认证") {
+			// refresh admin token and retry once
+			p.mu.Lock()
+			p.cloudmailToken = ""
+			p.mu.Unlock()
+			tok2, err := p.cloudmailLogin()
+			if err != nil {
+				return "", err
+			}
+			req2, _ := http.NewRequest(http.MethodGet, api+"/email/list?"+q.Encode(), nil)
+			req2.Header.Set("Authorization", tok2)
+			req2.Header.Set("Accept", "application/json")
+			resp2, err := client.Do(req2)
+			if err != nil {
+				return "", err
+			}
+			defer resp2.Body.Close()
+			body, _ = io.ReadAll(io.LimitReader(resp2.Body, 4<<20))
+			if resp2.StatusCode != 200 {
+				return "", fmt.Errorf("cloudmail email/list http=%d", resp2.StatusCode)
+			}
+		} else {
+			return "", fmt.Errorf("cloudmail email/list http=%d body=%s", resp.StatusCode, truncate(string(body), 80))
+		}
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", err
+	}
+	if code, ok := doc["code"].(float64); ok && int(code) != 200 {
+		// try latest endpoint as fallback
+		return p.cloudmailFetchLatest(api, tok, h.AccountID)
+	}
+	items := extractCloudmailMessages(doc)
+	if len(items) == 0 {
+		// fallback: /email/latest
+		return p.cloudmailFetchLatest(api, tok, h.AccountID)
+	}
+	var b strings.Builder
+	for _, m := range items {
+		fmt.Fprintf(&b, "%v\n%v\n%v\n%v\n%v\n",
+			m["subject"], m["text"], m["html"], m["content"], m["raw"])
+	}
+	return b.String(), nil
+}
+
+func (p *Provider) cloudmailFetchLatest(api, tok, accountID string) (string, error) {
+	q := url.Values{}
+	q.Set("emailId", "0")
+	q.Set("accountId", accountID)
+	q.Set("allReceive", "0")
+	req, err := http.NewRequest(http.MethodGet, api+"/email/latest?"+q.Encode(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", tok)
+	req.Header.Set("Accept", "application/json")
+	resp, err := p.mailClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("cloudmail email/latest http=%d", resp.StatusCode)
+	}
+	var doc map[string]any
+	_ = json.Unmarshal(body, &doc)
+	items := extractCloudmailMessages(doc)
+	var b strings.Builder
+	for _, m := range items {
+		fmt.Fprintf(&b, "%v\n%v\n%v\n%v\n%v\n",
+			m["subject"], m["text"], m["html"], m["content"], m["raw"])
+	}
+	return b.String(), nil
 }
 
 func (p *Provider) testmailFetch(h Handle) (string, error) {

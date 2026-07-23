@@ -99,7 +99,7 @@ func printHelp() {
   grok help                       显示帮助
 
 说明:
-  -t / --target   目标账号数 = 探活成功写入 CPA/ 的数量 (1-10000)
+  -t / --target   目标账号数 = 探活成功写入 CPA/ 的数量 (0=无限，1-100000)
   --thread / -j   并发注册/Turnstile 线程数 (1-8)，不再写入 config.env
   升级后请查看 ~/.grok/config.env.example 了解新增配置项
 
@@ -202,7 +202,7 @@ func cmdStart(args []string) error {
 	// Interactive prompts when flags omitted
 	reader := bufio.NewReader(os.Stdin)
 	if !targetSet {
-		fmt.Print("注册数量 (探活成功计 1，1-10000) [10]: ")
+		fmt.Print("注册数量 (探活成功计 1；0=无限；最大 100000) [10]: ")
 		line, _ := reader.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -352,8 +352,8 @@ func runWorker(args []string) error {
 			continue
 		case "--target":
 			if i+1 < len(args) {
-				n, _ := strconv.Atoi(args[i+1])
-				if n > 0 {
+				// n==0 means infinite; always accept non-negative parse
+				if n, err := strconv.Atoi(args[i+1]); err == nil && n >= 0 {
 					target = n
 				}
 				i++

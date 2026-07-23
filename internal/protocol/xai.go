@@ -119,50 +119,108 @@ func (c *Client) Config() SignupConfig {
 }
 
 func (c *Client) FetchConfig() (SignupConfig, error) {
-	c.applyClearanceCookies()
-	req, err := http.NewRequest(http.MethodGet, SignupURLGrok, nil)
-	if err != nil {
-		return SignupConfig{}, err
+	// Cloudflare path MUST go through WARP+Privoxy+FlareSolverr.
+	// cf_clearance is browser-fingerprint-bound: replaying cookies with Go's plain
+	// HTTP client almost always yields 403. Prefer FlareSolverr HTML for site key /
+	// state tree, then resolve Next.js Action ID from chunk JS (via FS, then proxy).
+	var html string
+	cfg := SignupConfig{}
+	if c.clear != nil {
+		res, err := c.clear.Solve(SignupURLGrok)
+		if err != nil {
+			return SignupConfig{}, fmt.Errorf("flaresolverr signup: %w", err)
+		}
+		// Refresh cookies/UA from the same browser session that produced HTML.
+		if len(res.Cookies) > 0 || res.UserAgent != "" {
+			c.mu.Lock()
+			// apply into clearance bundle via local jar
+			c.mu.Unlock()
+			u, _ := url.Parse(SiteURL)
+			var cookies []*http.Cookie
+			for _, ck := range res.Cookies {
+				cookies = append(cookies, &http.Cookie{
+					Name: ck.Name, Value: ck.Value, Domain: ck.Domain, Path: ck.Path,
+				})
+			}
+			if len(cookies) > 0 {
+				c.http.Jar.SetCookies(u, cookies)
+			}
+			if res.UserAgent != "" {
+				c.ua = res.UserAgent
+			}
+		}
+		html = res.HTML
+		cfg.Source = fmt.Sprintf("flaresolverr status=%d html=%d", res.Status, len(html))
+		if res.Status != 200 || html == "" || isCloudflare(res.Status, html, http.Header{}) {
+			return cfg, fmt.Errorf("signup page blocked via flaresolverr status=%d", res.Status)
+		}
+	} else {
+		// Fallback: direct HTTP (usually fails under CF without clearance stack)
+		c.applyClearanceCookies()
+		req, err := http.NewRequest(http.MethodGet, SignupURLGrok, nil)
+		if err != nil {
+			return SignupConfig{}, err
+		}
+		c.setBrowserHeaders(req)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+		req.Header.Set("Referer", "https://grok.com/")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return SignupConfig{}, err
+		}
+		defer resp.Body.Close()
+		html, err = readBody(resp)
+		if err != nil {
+			return SignupConfig{}, err
+		}
+		cfg.Source = fmt.Sprintf("http status=%d", resp.StatusCode)
+		if resp.StatusCode != 200 || isCloudflare(resp.StatusCode, html, resp.Header) {
+			cfg.Source += " (blocked_or_empty)"
+			return cfg, fmt.Errorf("signup page blocked status=%d", resp.StatusCode)
+		}
 	}
-	c.setBrowserHeaders(req)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	req.Header.Set("Referer", "https://grok.com/")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return SignupConfig{}, err
-	}
-	defer resp.Body.Close()
-	html, err := readBody(resp)
-	if err != nil {
-		return SignupConfig{}, err
-	}
-	cfg := SignupConfig{Source: fmt.Sprintf("http status=%d", resp.StatusCode)}
-	if resp.StatusCode != 200 || isCloudflare(resp.StatusCode, html, resp.Header) {
-		cfg.Source += " (blocked_or_empty)"
-		return cfg, fmt.Errorf("signup page blocked status=%d", resp.StatusCode)
-	}
+
 	if m := siteKeyRe.FindString(html); m != "" {
 		cfg.SiteKey = m
 	}
 	cfg.StateTree = scrapeStateTree(html)
+	// Action ID lives in Next.js chunk JS. Static assets usually pass via WARP
+	// proxy without needing a full FlareSolverr browser session per file.
 	jsURLs := unique(jsSrcRe.FindAllStringSubmatch(html, -1))
+	// Scan all chunks (typically ~40). Keep each fetch short; stop on first action hash.
+	probed := 0
+	var lastJSErr error
 	for _, path := range jsURLs {
 		if cfg.ActionID != "" {
 			break
 		}
+		probed++
 		js, err := c.fetchJS(path)
-		if err != nil || js == "" {
+		if err != nil {
+			lastJSErr = err
 			continue
 		}
-		if !strings.Contains(js, "createUser") && !strings.Contains(js, "registerUser") && !strings.Contains(js, "emailValidation") {
+		if js == "" {
+			continue
+		}
+		// Prefer chunks that look like signup server-action modules.
+		interesting := strings.Contains(js, "createUser") ||
+			strings.Contains(js, "registerUser") ||
+			strings.Contains(js, "emailValidation") ||
+			strings.Contains(js, "createEmailValidation") ||
+			strings.Contains(js, "createUserAndSession") ||
+			strings.Contains(js, "signUp")
+		if !interesting {
 			continue
 		}
 		if hexes := hex40Re.FindAllString(js, -1); len(hexes) > 0 {
 			cfg.ActionID = hexes[0]
+			break
 		}
 	}
+	_ = lastJSErr
 	if cfg.SiteKey == "" || cfg.ActionID == "" || cfg.StateTree == "" {
-		return cfg, fmt.Errorf("config incomplete site_key=%v action=%v state=%v", cfg.SiteKey != "", cfg.ActionID != "", cfg.StateTree != "")
+		return cfg, fmt.Errorf("config incomplete site_key=%v action=%v state=%v source=%s js_probed=%d", cfg.SiteKey != "", cfg.ActionID != "", cfg.StateTree != "", cfg.Source, probed)
 	}
 	c.mu.Lock()
 	c.cfg = cfg
@@ -171,18 +229,37 @@ func (c *Client) FetchConfig() (SignupConfig, error) {
 }
 
 func (c *Client) fetchJS(path string) (string, error) {
+	// Fetch JS over REGISTER_PROXY (WARP/Privoxy). Do NOT use FlareSolverr here:
+	// each FS solve starts a browser and was causing multi-minute hangs.
+	// Ensure clearance cookies/UA from prewarm/FS are attached.
+	c.applyClearanceCookies()
 	req, err := http.NewRequest(http.MethodGet, SiteURL+path, nil)
 	if err != nil {
 		return "", err
 	}
 	c.setBrowserHeaders(req)
 	req.Header.Set("Referer", SignupURLGrok)
-	resp, err := c.http.Do(req)
+	req.Header.Set("Accept", "*/*")
+	// Short timeout per chunk so a bad asset can't hang the whole config phase.
+	client := *c.http
+	client.Timeout = 12 * time.Second
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	return readBody(resp)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("js http=%d", resp.StatusCode)
+	}
+	body, err := readBody(resp)
+	if err != nil {
+		return "", err
+	}
+	// Cloudflare challenge HTML is not useful JS.
+	if isCloudflare(resp.StatusCode, body, resp.Header) || strings.Contains(strings.ToLower(body), "just a moment") {
+		return "", fmt.Errorf("js blocked by cloudflare")
+	}
+	return body, nil
 }
 
 func (c *Client) CreateEmailCode(email string) error {

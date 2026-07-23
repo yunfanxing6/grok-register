@@ -87,7 +87,7 @@ docker compose version || sudo apt install -y docker-compose-plugin
 ```bash
 sudo mkdir -p /opt
 cd /opt
-sudo git clone https://github.com/Charles-0509/Grok-Register.git
+sudo git clone https://github.com/yunfanxing6/grok-register.git
 cd /opt/Grok-Register
 
 export PATH=$PATH:/usr/local/go/bin

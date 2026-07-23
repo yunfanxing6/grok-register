@@ -180,8 +180,11 @@ func FormatStatus(snap state.Snapshot) string {
 	if snap.RunID != "" {
 		b.WriteString(fmt.Sprintf("Run:  %s\n", snap.RunID))
 	}
-	if snap.Target > 0 || snap.Done > 0 {
+	if snap.Target > 0 {
 		b.WriteString(fmt.Sprintf("进度: %d/%d\n", snap.Done, snap.Target))
+	} else if snap.Done > 0 || snap.Status == state.StatusRunning {
+		// target=0 => infinite mode
+		b.WriteString(fmt.Sprintf("进度: %d/∞\n", snap.Done))
 	}
 	w := snap.Workers
 	if w.S+w.P+w.C+w.OAuth > 0 {

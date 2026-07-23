@@ -109,7 +109,7 @@ func (m *Manager) Prewarm() (string, error) {
 
 	for _, u := range m.URLs {
 		start := time.Now()
-		cookies, userAgent, status, err := m.solveOne(client, u)
+		res, err := m.solveOne(client, u)
 		elapsed := time.Since(start).Seconds()
 		if err != nil {
 			failN++
@@ -118,18 +118,18 @@ func (m *Manager) Prewarm() (string, error) {
 		}
 		okN++
 		cf := "cf-"
-		for _, c := range cookies {
+		for _, c := range res.Cookies {
 			if c.Name == "cf_clearance" {
 				cf = "cf+"
 				break
 			}
 		}
 		parts = append(parts, fmt.Sprintf("%s:%.1fs/%s", hostOf(u), elapsed, cf))
-		allCookies = mergeCookies(allCookies, cookies)
-		if userAgent != "" {
-			ua = userAgent
+		allCookies = mergeCookies(allCookies, res.Cookies)
+		if res.UserAgent != "" {
+			ua = res.UserAgent
 		}
-		_ = status
+		_ = res.Status
 	}
 
 	m.mu.Lock()
@@ -143,7 +143,22 @@ func (m *Manager) Prewarm() (string, error) {
 	return msg, nil
 }
 
-func (m *Manager) solveOne(client *http.Client, target string) ([]Cookie, string, int, error) {
+// SolveResult is one FlareSolverr request.get outcome (cookies + UA + HTML body).
+// HTML is the reliable source for signup config: cf_clearance is browser-bound and
+// cannot be safely replayed by Go's plain HTTP client.
+type SolveResult struct {
+	Cookies   []Cookie
+	UserAgent string
+	Status    int
+	HTML      string
+}
+
+func (m *Manager) Solve(target string) (SolveResult, error) {
+	client := &http.Client{Timeout: m.Timeout}
+	return m.solveOne(client, target)
+}
+
+func (m *Manager) solveOne(client *http.Client, target string) (SolveResult, error) {
 	reqBody := fsRequest{
 		Cmd:        "request.get",
 		URL:        target,
@@ -155,21 +170,21 @@ func (m *Manager) solveOne(client *http.Client, target string) ([]Cookie, string
 	raw, _ := json.Marshal(reqBody)
 	httpReq, err := http.NewRequest(http.MethodPost, m.FSURL+"/v1", bytes.NewReader(raw))
 	if err != nil {
-		return nil, "", 0, err
+		return SolveResult{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return nil, "", 0, err
+		return SolveResult{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	var fs fsResponse
 	if err := json.Unmarshal(body, &fs); err != nil {
-		return nil, "", 0, fmt.Errorf("fs json: %w", err)
+		return SolveResult{}, fmt.Errorf("fs json: %w", err)
 	}
 	if fs.Status != "ok" || fs.Solution == nil {
-		return nil, "", 0, fmt.Errorf("fs status=%s msg=%s", fs.Status, fs.Message)
+		return SolveResult{}, fmt.Errorf("fs status=%s msg=%s", fs.Status, fs.Message)
 	}
 	var cookies []Cookie
 	for _, c := range fs.Solution.Cookies {
@@ -187,7 +202,16 @@ func (m *Manager) solveOne(client *http.Client, target string) ([]Cookie, string
 		}
 		cookies = append(cookies, Cookie{Name: name, Value: val, Domain: dom, Path: path})
 	}
-	return cookies, fs.Solution.UserAgent, fs.Solution.Status, nil
+	html := ""
+	if fs.Solution != nil {
+		html = fs.Solution.Response
+	}
+	return SolveResult{
+		Cookies:   cookies,
+		UserAgent: fs.Solution.UserAgent,
+		Status:    fs.Solution.Status,
+		HTML:      html,
+	}, nil
 }
 
 func mergeCookies(base, add []Cookie) []Cookie {

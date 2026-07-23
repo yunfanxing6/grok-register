@@ -16,9 +16,10 @@ var embeddedExample string
 type EmailMode string
 
 const (
-	EmailTempmail EmailMode = "tempmail"
-	EmailTestmail EmailMode = "testmail"
-	EmailCustom   EmailMode = "custom"
+	EmailTempmail  EmailMode = "tempmail"
+	EmailTestmail  EmailMode = "testmail"
+	EmailCustom    EmailMode = "custom"
+	EmailCloudmail EmailMode = "cloudmail"
 )
 
 type Config struct {
@@ -30,6 +31,15 @@ type Config struct {
 	TestmailAPIKey    string
 	TestmailNamespace string
 	TestmailDomain    string // default inbox.testmail.app
+
+	// Cloud Mail (e.g. https://xxx.workers.dev/api)
+	// Login: POST /login  Create: POST /account/add  Poll: GET /email/list
+	// Auth header is raw JWT: Authorization: <token>  (no Bearer prefix)
+	CloudmailAdminEmail    string
+	CloudmailAdminPassword string
+	// Optional dedicated proxy for Cloud Mail only (e.g. local V2RayN :10808).
+	// Register/Turnstile still use REGISTER_PROXY (WARP :40080). Empty = inherit HTTP_PROXY.
+	CloudmailProxy string
 
 	ClearanceEnabled bool
 	RegisterProxy    string
@@ -68,6 +78,20 @@ type Config struct {
 	CPAUploadNameTemplate string
 	CPAUploadVerify       bool
 	CPAUploadMode         string // multipart | json
+
+	// grok2api sinks (auto upload after register)
+	// jiujiu: SSO only via POST /admin/api/tokens/add
+	G2AJiujiuEnabled bool
+	G2AJiujiuBase    string // http://127.0.0.1:8000
+	G2AJiujiuToken   string // ADMIN_PASSWORD as Bearer
+	G2AJiujiuPool    string // basic
+	// chenyme: SSO (web import) + Build OAuth (CPA JSON import)
+	G2AChenymeEnabled     bool
+	G2AChenymeBase        string // http://127.0.0.1:8001
+	G2AChenymeUser        string
+	G2AChenymePassword    string
+	G2AChenymeUploadSSO   bool
+	G2AChenymeUploadBuild bool
 }
 
 func Defaults() Config {
@@ -168,7 +192,8 @@ func InteractiveSetup(path string) (Config, error) {
 	fmt.Println("  [1] 免费临时邮箱           (tempmail.lol · 默认 · 直接回车)")
 	fmt.Println("  [2] testmail.app           (GitHub Student Pack Essential 等)")
 	fmt.Println("  [3] 自建域名邮箱           (Cloudflare Email Routing + webhook)")
-	fmt.Print("输入 1 / 2 / 3 [1]: ")
+	fmt.Println("  [4] Cloud Mail             (自建 serverless 邮箱，如 workers.dev)")
+	fmt.Print("输入 1 / 2 / 3 / 4 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -200,6 +225,20 @@ func InteractiveSetup(path string) (Config, error) {
 			api = "http://127.0.0.1:8080"
 		}
 		cfg.EmailAPI = api
+	case "4":
+		cfg.EmailMode = EmailCloudmail
+		fmt.Print("  Cloud Mail API 根 (如 https://xxx.workers.dev/api): ")
+		api, _ := reader.ReadString('\n')
+		cfg.EmailAPI = strings.TrimSpace(api)
+		fmt.Print("  邮箱域名 (如 example.com): ")
+		dom, _ := reader.ReadString('\n')
+		cfg.EmailDomain = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(dom), "@"))
+		fmt.Print("  管理员邮箱: ")
+		adm, _ := reader.ReadString('\n')
+		cfg.CloudmailAdminEmail = strings.TrimSpace(adm)
+		fmt.Print("  管理员密码: ")
+		pwd, _ := reader.ReadString('\n')
+		cfg.CloudmailAdminPassword = strings.TrimSpace(pwd)
 	default:
 		cfg.EmailMode = EmailTempmail
 	}
@@ -214,19 +253,31 @@ func InteractiveSetup(path string) (Config, error) {
 			_ = f.Close()
 		}
 	}
+	if cfg.EmailMode == EmailCloudmail {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "CLOUDMAIL_ADMIN_EMAIL=%s\nCLOUDMAIL_ADMIN_PASSWORD=%s\n", cfg.CloudmailAdminEmail, cfg.CloudmailAdminPassword)
+			_ = f.Close()
+		}
+	}
 	fmt.Printf("[*] 已写入 %s\n", path)
 	return cfg, nil
 }
 
+// ClampTarget validates -t / --target.
+// n == 0 means continuous/infinite mode (never stop on count).
 func ClampTarget(n int) (int, error) {
-	if n < 1 {
-		return 0, fmt.Errorf("target must be >= 1, got %d", n)
+	if n < 0 {
+		return 0, fmt.Errorf("target must be >= 0 (0=无限), got %d", n)
 	}
-	if n > 10000 {
-		return 0, fmt.Errorf("target max is 10000, got %d", n)
+	if n > 100000 {
+		return 0, fmt.Errorf("target max is 100000, got %d", n)
 	}
 	return n, nil
 }
+
+// IsInfiniteTarget reports continuous mode (never stop by success count).
+func IsInfiniteTarget(n int) bool { return n <= 0 }
 
 // ClampThreads limits concurrent register/mint threads to 1–8.
 func ClampThreads(n int) (int, error) {
@@ -294,6 +345,31 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["TESTMAIL_DOMAIN"]; ok {
 		cfg.TestmailDomain = v
+	}
+	if v, ok := env["CLOUDMAIL_ADMIN_EMAIL"]; ok {
+		cfg.CloudmailAdminEmail = v
+	}
+	if v, ok := env["CLOUDMAIL_ADMIN_PASSWORD"]; ok {
+		cfg.CloudmailAdminPassword = v
+	}
+	if v, ok := env["CLOUDMAIL_PROXY"]; ok {
+		cfg.CloudmailProxy = v
+	}
+	// aliases used by yunfanxing6/grok-register config style
+	if v, ok := env["TEMP_MAIL_ADMIN_EMAIL"]; ok && cfg.CloudmailAdminEmail == "" {
+		cfg.CloudmailAdminEmail = v
+	}
+	if v, ok := env["TEMP_MAIL_ADMIN_PASSWORD"]; ok && cfg.CloudmailAdminPassword == "" {
+		cfg.CloudmailAdminPassword = v
+	}
+	if v, ok := env["TEMP_MAIL_API_BASE"]; ok && cfg.EmailAPI == "" {
+		cfg.EmailAPI = v
+	}
+	if v, ok := env["TEMP_MAIL_DOMAIN"]; ok && cfg.EmailDomain == "" {
+		cfg.EmailDomain = v
+	}
+	if v, ok := env["TEMP_MAIL_PROXY"]; ok && cfg.CloudmailProxy == "" {
+		cfg.CloudmailProxy = v
 	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
@@ -379,6 +455,58 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["CPA_UPLOAD_MODE"]; ok {
 		cfg.CPAUploadMode = v
+	}
+	// --- grok2api sinks ---
+	if v, ok := env["G2A_JIUJIU_ENABLED"]; ok {
+		cfg.G2AJiujiuEnabled = truthy(v)
+	}
+	if v, ok := env["G2A_JIUJIU_BASE"]; ok {
+		cfg.G2AJiujiuBase = v
+	}
+	if v, ok := env["G2A_JIUJIU_TOKEN"]; ok {
+		cfg.G2AJiujiuToken = v
+	}
+	if v, ok := env["G2A_JIUJIU_ADMIN_PASSWORD"]; ok && cfg.G2AJiujiuToken == "" {
+		cfg.G2AJiujiuToken = v
+	}
+	if v, ok := env["G2A_JIUJIU_POOL"]; ok {
+		cfg.G2AJiujiuPool = v
+	}
+	if v, ok := env["G2A_CHENYME_ENABLED"]; ok {
+		cfg.G2AChenymeEnabled = truthy(v)
+	}
+	if v, ok := env["G2A_CHENYME_BASE"]; ok {
+		cfg.G2AChenymeBase = v
+	}
+	if v, ok := env["G2A_CHENYME_USER"]; ok {
+		cfg.G2AChenymeUser = v
+	}
+	if v, ok := env["G2A_CHENYME_PASSWORD"]; ok {
+		cfg.G2AChenymePassword = v
+	}
+	if v, ok := env["G2A_CHENYME_UPLOAD_SSO"]; ok {
+		cfg.G2AChenymeUploadSSO = truthy(v)
+	}
+	if v, ok := env["G2A_CHENYME_UPLOAD_BUILD"]; ok {
+		cfg.G2AChenymeUploadBuild = truthy(v)
+	}
+	// if chenyme enabled but flags unset, enable both by default when keys present
+	if cfg.G2AChenymeEnabled {
+		if _, ok := env["G2A_CHENYME_UPLOAD_SSO"]; !ok {
+			cfg.G2AChenymeUploadSSO = true
+		}
+		if _, ok := env["G2A_CHENYME_UPLOAD_BUILD"]; !ok {
+			cfg.G2AChenymeUploadBuild = true
+		}
+	}
+	if cfg.G2AJiujiuBase == "" {
+		cfg.G2AJiujiuBase = "http://127.0.0.1:8000"
+	}
+	if cfg.G2AJiujiuPool == "" {
+		cfg.G2AJiujiuPool = "basic"
+	}
+	if cfg.G2AChenymeBase == "" {
+		cfg.G2AChenymeBase = "http://127.0.0.1:8001"
 	}
 }
 

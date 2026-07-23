@@ -13,7 +13,8 @@ grok upload    # 手动上传 CPA JSON 到 Management API
 ```
 
 **中文全流程教程（域名 + VPS + Cloud Mail + grok2api + 反代）：**  
-[docs/TUTORIAL.zh-CN.md](./docs/TUTORIAL.zh-CN.md)
+- 仓库版（技术向）：[docs/TUTORIAL.zh-CN.md](./docs/TUTORIAL.zh-CN.md)  
+- **X 长文版（可直接发）**：[docs/X-ARTICLE.zh-CN.md](./docs/X-ARTICLE.zh-CN.md)
 
 ---
 

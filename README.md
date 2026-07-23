@@ -1,8 +1,8 @@
 # Grok-Register
 
-Grok 免费号 **注册 → OAuth → CPA 可用 JSON** 二合一 CLI（Go）。
+Grok 免费号 **注册 → OAuth → 自动入池** 二合一 CLI（Go）。
 
-一条命令后台跑完，产物可直接导入 CPA / cliproxy 类网关。
+一条命令后台跑完，可直接导入 [chenyme/grok2api](https://github.com/chenyme/grok2api) 或 CPA / cliproxy 类网关。
 
 ```bash
 grok start -t 10
@@ -12,17 +12,19 @@ grok stop
 grok upload    # 手动上传 CPA JSON 到 Management API
 ```
 
+**中文全流程教程（域名 + VPS + Cloud Mail + grok2api + 反代）：**  
+[docs/TUTORIAL.zh-CN.md](./docs/TUTORIAL.zh-CN.md)
+
 ---
 
 ## 功能
 
-- 临时邮箱 / 自建域名邮箱注册
+- 临时邮箱 / Cloud Mail 自建域名邮箱 / testmail.app
 - 注册成功后立刻 Device Flow OAuth
 - 整备 `cli-chat-proxy` + grok-cli headers 的 CPA JSON
-- 可选探活；可选自动上传到 CPA Management API
+- 可选探活；可选自动上传到 **grok2api**（jiujiu / chenyme）或 CPA Management API
 - 内置 Cloudflare 清障 compose（WARP + Privoxy + FlareSolverr）
 - Turnstile：默认 **Playwright + CloakBrowser**（与原 Python 注册机同路径），可选 lite farm
-
 ---
 
 ## 系统要求

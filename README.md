@@ -25,6 +25,7 @@ grok upload    # 手动上传 CPA JSON 到 Management API
 - 可选探活；可选自动上传到 **grok2api**（jiujiu / chenyme）或 CPA Management API
 - 内置 Cloudflare 清障 compose（WARP + Privoxy + FlareSolverr）
 - Turnstile：默认 **Playwright + CloakBrowser**（与原 Python 注册机同路径），可选 lite farm
+- **Server Action 自动刷新**：xAI 前端发版导致 `Server action not found` 时，自动重抓 Action ID（无需手动重启）
 ---
 
 ## 系统要求

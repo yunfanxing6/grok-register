@@ -65,6 +65,15 @@ type Engine struct {
 	uploader *cpa.Uploader
 	g2a      *sink.Uploader
 
+	// scfg is the live signup config (Action ID / site key / state tree).
+	// xAI rotates Next.js Server Action IDs on deploy; workers re-read this
+	// under RLock and cWorker hot-reloads it after "Server action not found".
+	scfgMu          sync.RWMutex
+	scfg            protocol.SignupConfig
+	scfgRefreshMu   sync.Mutex
+	scfgLastRefresh time.Time
+	actionStaleN    atomic.Int64 // consecutive action-stale signup failures
+
 	done     atomic.Int64 // CPA successes (counts toward -t)
 	reserved atomic.Int64 // in-flight accounts (email→register→oauth→probe)
 	ssoN     atomic.Int64
@@ -76,6 +85,9 @@ type Engine struct {
 	wgOAuth sync.WaitGroup
 	wgAux   sync.WaitGroup // status ticker etc
 }
+
+// Min interval between automatic signup-config refreshes (FlareSolverr is expensive).
+const signupConfigRefreshMinInterval = 90 * time.Second
 
 // softSeatCap limits in-flight accounts (especially important for infinite mode).
 func (e *Engine) softSeatCap() int {
@@ -108,6 +120,75 @@ func (e *Engine) remainingCapacity() int {
 		return 0
 	}
 	return n
+}
+
+func (e *Engine) getSignupConfig() protocol.SignupConfig {
+	e.scfgMu.RLock()
+	defer e.scfgMu.RUnlock()
+	return e.scfg
+}
+
+func (e *Engine) setSignupConfig(cfg protocol.SignupConfig) {
+	e.scfgMu.Lock()
+	e.scfg = cfg
+	e.scfgMu.Unlock()
+}
+
+// isStaleActionError detects xAI rotating Next.js Server Action IDs.
+// Typical: signup http=404 body=Server action not found.
+func isStaleActionError(err error, body string) bool {
+	var b strings.Builder
+	if err != nil {
+		b.WriteString(err.Error())
+		b.WriteByte(' ')
+	}
+	b.WriteString(body)
+	s := strings.ToLower(b.String())
+	if strings.Contains(s, "server action not found") {
+		return true
+	}
+	// Defensive: 404 on Next-Action with empty/unknown body after deploy.
+	if strings.Contains(s, "http=404") && (strings.Contains(s, "action") || strings.Contains(s, "not found")) {
+		return true
+	}
+	return false
+}
+
+// maybeRefreshSignupConfig re-scrapes site key / Action ID / state tree.
+// Triggered when signup fails with stale Server Action (xAI front-end deploy).
+// Single-flight + min interval so multi-thread C workers don't stampede FlareSolverr.
+func (e *Engine) maybeRefreshSignupConfig(reason string) bool {
+	e.scfgRefreshMu.Lock()
+	defer e.scfgRefreshMu.Unlock()
+
+	if since := time.Since(e.scfgLastRefresh); since < signupConfigRefreshMinInterval && !e.scfgLastRefresh.IsZero() {
+		e.opt.Log.Warnf("signup config refresh skipped (cooldown %.0fs left, reason=%s)",
+			(signupConfigRefreshMinInterval - since).Seconds(), reason)
+		return false
+	}
+	e.scfgLastRefresh = time.Now()
+
+	old := e.getSignupConfig()
+	e.opt.Log.Warnf("刷新注册配置 (reason=%s old_action=%s...)", reason, trim(old.ActionID, 12))
+	_ = e.opt.Store.Set(func(s *state.Snapshot) {
+		s.Phase = state.PhaseRegister
+		s.PhaseDetail = "刷新注册配置 (Action ID)"
+	})
+
+	cfg, err := e.xai.FetchConfig()
+	if err != nil {
+		e.opt.Log.Warnf("signup config refresh failed: %v", err)
+		return false
+	}
+	e.setSignupConfig(cfg)
+	e.actionStaleN.Store(0)
+	if cfg.ActionID != old.ActionID || cfg.StateTree != old.StateTree || cfg.SiteKey != old.SiteKey {
+		e.opt.Log.OKf("注册配置已更新 ACTION_ID=%s... (was %s...)",
+			trim(cfg.ActionID, 12), trim(old.ActionID, 12))
+	} else {
+		e.opt.Log.Infof("注册配置重抓完成，Action ID 未变 ACTION_ID=%s...", trim(cfg.ActionID, 12))
+	}
+	return true
 }
 
 // tryReserve claims one pipeline seat for a new account attempt.
@@ -329,6 +410,8 @@ func (e *Engine) run(ctx context.Context) error {
 		})
 		return fmt.Errorf("config fetch: %w", err)
 	}
+	e.setSignupConfig(scfg)
+	e.scfgLastRefresh = time.Now()
 	log.Infof("SITE_KEY=%s ACTION_ID=%s...", scfg.SiteKey, trim(scfg.ActionID, 12))
 	if config.IsInfiniteTarget(e.opt.Target) {
 		log.OKf("注册服务已启动 | 目标 无限 | run=%s", e.opt.Run.RunID)
@@ -369,7 +452,7 @@ func (e *Engine) run(ctx context.Context) error {
 
 	for i := 0; i < sWorkers; i++ {
 		e.wgReg.Add(1)
-		go e.sWorker(ctx, i, scfg)
+		go e.sWorker(ctx, i)
 	}
 	for i := 0; i < pWorkers; i++ {
 		e.wgReg.Add(1)
@@ -377,7 +460,7 @@ func (e *Engine) run(ctx context.Context) error {
 	}
 	for i := 0; i < cWorkers; i++ {
 		e.wgReg.Add(1)
-		go e.cWorker(ctx, i, scfg)
+		go e.cWorker(ctx, i)
 	}
 	for i := 0; i < oauthWorkers; i++ {
 		e.wgOAuth.Add(1)
@@ -462,7 +545,7 @@ func waitGroupTimeout(wg *sync.WaitGroup, d time.Duration, log *logx.Logger, nam
 	}
 }
 
-func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig) {
+func (e *Engine) sWorker(ctx context.Context, id int) {
 	defer e.wgReg.Done()
 	log := e.opt.Log
 	pageURL := protocol.SiteURL + "/sign-up"
@@ -498,10 +581,19 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			return
 		default:
 		}
+		siteKey := e.getSignupConfig().SiteKey
+		if siteKey == "" {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
 		if err := e.phys.Acquire(ctx); err != nil {
 			return
 		}
-		tok, err := e.turn.Solve(ctx, scfg.SiteKey, pageURL)
+		tok, err := e.turn.Solve(ctx, siteKey, pageURL)
 		e.phys.Release()
 		if err != nil {
 			log.Warnf("[S%d] turnstile: %v", id, err)
@@ -618,7 +710,7 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 	}
 }
 
-func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig) {
+func (e *Engine) cWorker(ctx context.Context, id int) {
 	defer e.wgReg.Done()
 	log := e.opt.Log
 	for {
@@ -645,6 +737,7 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			e.releaseReserve()
 			continue
 		}
+		scfg := e.getSignupConfig()
 		body := protocol.BuildSignupBody(q.Email, q.Password, q.Code, token)
 		text, sso, err := e.xai.SignupServerAction(body, scfg.ActionID, scfg.StateTree)
 		if sso == "" {
@@ -657,10 +750,20 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 				preview = preview[:180]
 			}
 			log.Warnf("signup fail %s: err=%v sso=%v body=%q", q.Email, err, sso != "", preview)
+			// xAI front-end deploy invalidates Next-Action hashes → 404 "Server action not found".
+			// Hot-reload signup config so the next attempt uses the new Action ID (no restart).
+			if isStaleActionError(err, text) {
+				n := e.actionStaleN.Add(1)
+				log.Warnf("检测到过期 Server Action (连续 %d 次)，尝试自动刷新配置", n)
+				e.maybeRefreshSignupConfig(fmt.Sprintf("stale_action_n=%d", n))
+			} else {
+				e.actionStaleN.Store(0)
+			}
 			e.fail.Add(1)
 			e.releaseReserve() // free seat for another attempt
 			continue
 		}
+		e.actionStaleN.Store(0)
 
 		// ensure run dirs exist (first credential)
 		accPath := filepath.Join(e.opt.Run.SSO, "accounts.txt")
